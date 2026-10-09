@@ -30,12 +30,11 @@ final class Store {
            FileManager.default.fileExists(atPath: legacyDir.path) {
             try? FileManager.default.moveItem(at: legacyDir, to: dir)
         }
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fileURL = dir.appendingPathComponent("data.json")
         logosDir = dir.appendingPathComponent("Logos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: logosDir, withIntermediateDirectories: true)
         notesDir = dir.appendingPathComponent("Notes", isDirectory: true)
-        try? FileManager.default.createDirectory(at: notesDir, withIntermediateDirectories: true)
+        for folder in [dir, logosDir, notesDir] { Self.makePrivateDirectory(folder) }
+        Self.restrictExistingFiles(in: dir)
         load()
         startDayTicker()
     }
@@ -52,11 +51,39 @@ final class Store {
 
     // MARK: Persistence
 
+    /// Owner-only folder (0700) so other accounts on this Mac can't list or read it.
+    private static func makePrivateDirectory(_ url: URL) {
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+
+    /// Tightens files written before permissions were enforced.
+    private static func restrictExistingFiles(in dir: URL) {
+        guard let items = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
+        for case let url as URL in items {
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            try? FileManager.default.setAttributes([.posixPermissions: isDir ? 0o700 : 0o600], ofItemAtPath: url.path)
+        }
+    }
+
+    /// Atomic write, then owner-only (0600) permissions.
+    private static func writePrivate(_ data: Data, to url: URL) throws {
+        try data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
     private func load() {
         guard let data = try? Data(contentsOf: fileURL) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard let snapshot = try? decoder.decode(Snapshot.self, from: data) else { return }
+        guard let snapshot = try? decoder.decode(Snapshot.self, from: data) else {
+            // Keep an unreadable file aside instead of overwriting it with an empty list on the next save.
+            let backup = fileURL.deletingLastPathComponent()
+                .appendingPathComponent("data.unreadable-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.moveItem(at: fileURL, to: backup)
+            return
+        }
         products = snapshot.products
         tasks = snapshot.tasks
         tags = snapshot.tags ?? []
@@ -75,7 +102,7 @@ final class Store {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(Snapshot(products: products, tasks: tasks, tags: tags)) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        try? Self.writePrivate(data, to: fileURL)
     }
 
     // MARK: Products
@@ -186,7 +213,7 @@ final class Store {
               let data = ImageUtils.encode(image, maxSide: 128, allowJPEG: false)?.data else { return false }
         let file = "\(id.uuidString)-\(UUID().uuidString.prefix(8)).png"
         do {
-            try data.write(to: logosDir.appendingPathComponent(file), options: .atomic)
+            try Self.writePrivate(data, to: logosDir.appendingPathComponent(file))
         } catch {
             return false
         }
@@ -227,7 +254,7 @@ final class Store {
         if text.length == 0 {
             removeNoteFile(id)
         } else if let data = text.rtfd(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]) {
-            try? data.write(to: noteURL(id), options: .atomic)
+            try? Self.writePrivate(data, to: noteURL(id))
         }
 
         var preview = text.string
